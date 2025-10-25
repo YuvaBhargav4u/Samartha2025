@@ -1,0 +1,16 @@
+# Backend
+fastapi
+uvicorn[standard]
+python-multipart
+tensorflow-cpu
+tensorflow-hub
+librosa
+peft
+bitsandbytes
+accelerate
+google-generativeai
+python-dotenv
+
+# UI
+streamlit
+requests
