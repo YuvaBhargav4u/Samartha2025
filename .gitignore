@@ -1,5 +1,5 @@
 #want to ignore .env files, venv and other environment variable files
 .env
 venv/
-backend/whisper_finetuned_speech
+#backend/whisper_finetuned_speech
 check_models.py
