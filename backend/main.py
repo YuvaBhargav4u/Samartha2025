@@ -9,43 +9,49 @@ import pandas as pd
 import google.generativeai as genai
 from dotenv import load_dotenv
 import tempfile
-from transformers import pipeline
+from transformers import WhisperForConditionalGeneration, WhisperProcessor
+from peft import PeftModel
 
 # --- Configuration ---
 load_dotenv()
 genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 
-WHISPER_MODEL_NAME = "openai/whisper-base"
+BASE_WHISPER_MODEL = "openai/whisper-base"
+FINETUNED_ADAPTER_PATH = "./whisper_finetuned_speech"
 YAMNET_MODEL_HANDLE = 'https://tfhub.dev/google/yamnet/1'
 
-# --- Model Loading (Done once at startup) ---
+# --- Model Loading ---
 print("Loading models...")
 
-whisper_pipeline = pipeline(
-    "automatic-speech-recognition",
-    model=WHISPER_MODEL_NAME,
-    device_map="auto"
+base_model = WhisperForConditionalGeneration.from_pretrained(
+    BASE_WHISPER_MODEL, load_in_8bit=True, device_map="auto"
 )
+whisper_model = PeftModel.from_pretrained(base_model, FINETUNED_ADAPTER_PATH)
+whisper_processor = WhisperProcessor.from_pretrained(BASE_WHISPER_MODEL, language="english", task="transcribe")
 
 yamnet_model = hub.load(YAMNET_MODEL_HANDLE)
 yamnet_class_map_path = yamnet_model.class_map_path().numpy().decode('utf-8')
 yamnet_class_names = pd.read_csv(yamnet_class_map_path)['display_name'].tolist()
 
-# --- MODIFIED LINE ---
-# Changed "gemini-pro" to "gemini-pro-vision" for broader availability
-llm = genai.GenerativeModel('gemini-2.5-flash')
-# --- END MODIFIED LINE ---
+# Use a model confirmed to work with your key
+llm = genai.GenerativeModel('gemini-2.5-flash') # Or 'gemini-pro'
 
-print("Models loaded successfully!")
+print("All models loaded successfully!")
 
 app = FastAPI()
 
 # --- Helper Functions ---
-def get_whisper_transcription(waveform, sample_rate):
-    result = whisper_pipeline({"raw": waveform, "sampling_rate": sample_rate})
-    return result["text"]
+def get_whisper_description(waveform, sample_rate):
+    """Generates a description using the fine-tuned Whisper model."""
+    inputs = whisper_processor(waveform, sampling_rate=sample_rate, return_tensors="pt")
+    input_features = inputs.input_features.to(whisper_model.device, dtype=torch.float16)
+    with torch.no_grad():
+        generated_ids = whisper_model.generate(inputs=input_features, max_new_tokens=100)
+    description = whisper_processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+    return description
 
 def get_yamnet_events(waveform, sample_rate):
+    """Detects general audio events using YAMNet."""
     if sample_rate != 16000:
         waveform = librosa.resample(y=waveform, orig_sr=sample_rate, target_sr=16000)
     scores, _, _ = yamnet_model(waveform)
@@ -66,29 +72,32 @@ async def process_audio(question: str = Form(...), audio_file: UploadFile = File
 
         waveform, sr = librosa.load(temp_audio_path, sr=16000)
 
-        whisper_text = get_whisper_transcription(waveform, sr)
+        whisper_desc = get_whisper_description(waveform, sr)
         yamnet_events = get_yamnet_events(waveform, sr)
 
         context = f"""
         ### Audio Analysis Report
-        **Audio Transcription (from Whisper):**
-        "{whisper_text if whisper_text else 'No speech detected.'}"
-
-        **Detected General Sounds (from YAMNet):**
-        - {', '.join(yamnet_events) if yamnet_events else 'None detected.'}
+        **Speech Transcription:** "{whisper_desc if whisper_desc else 'No speech detected.'}"
+        **Detected Background Sounds:** - {', '.join(yamnet_events) if yamnet_events else 'None detected.'}
         """
 
+        # --- MODIFIED AND IMPROVED PROMPT ---
         prompt = f"""
-        You are an intelligent audio analysis assistant. Based *only* on the provided "Audio Analysis Report", answer the user's question.
-        Do not make up information not present in the report.
+        You are an intelligent audio analysis assistant. Your task is to analyze the provided report and answer the user's question, by keeping in mind that the audio may only contain languages from the following list: arabic,english,hebrew,hindi,indonesian,russian,telugu,thai.
+
+        **Instructions:**
+        1.  Analyze the "Speech Transcription". It may contain special tags like `[Language: ...]` and `[Speaker: ...]`.
+        2.  If the language is NOT English, provide an English translation of the transcription.
+        3.  Use all the information in the report to give a comprehensive answer to the user's question.
+
         {context}
         ---
         **User's Question:** {question}
+
         **Answer:**
         """
 
         response = llm.generate_content(prompt)
-
         return {"answer": response.text}
 
     finally:
